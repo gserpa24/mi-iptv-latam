@@ -5,17 +5,19 @@
 actualizar.py - Generador y actualizador unificado de lista IPTV en español latino.
 Descarga fuentes de Perú, Argentina, Latinoamérica y Pluto TV Español,
 filtra canales no deseados en otros idiomas, elimina URLs duplicadas y
-verifica de manera concurrente con 20 hilos y timeout de 4 segundos
-que los streams estén activos antes de generar 'mi_tele_latam.m3u'.
+realiza una validación profunda de streams HLS (verificación de cabecera #EXTM3U
+y validación del primer segmento/variante interno) para eliminar canales caídos,
+pantallas negras o errores 403/404 antes de generar 'mi_tele_latam.m3u'.
 """
 
 import sys
 import re
+import urllib.parse
 import urllib3
 import requests
 from concurrent.futures import ThreadPoolExecutor
 
-# Deshabilitar advertencias de certificados no verificados para evitar ruido en consola
+# Deshabilitar advertencias de certificados SSL no verificados
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Fuentes oficiales
@@ -37,8 +39,7 @@ HEADERS = {
     "Accept": "*/*",
 }
 
-ALLOWED_HTTP_CODES = {200, 206, 301, 302}
-TIMEOUT = 4
+ALLOWED_HTTP_CODES = {200, 206}
 MAX_WORKERS = 20
 OUTPUT_FILE = "mi_tele_latam.m3u"
 
@@ -111,13 +112,11 @@ def parse_m3u(content: str):
                     i += 1
                     continue
                 if next_line.startswith("#EXTINF"):
-                    # Se encontró otro EXTINF antes de URL
                     break
                 if next_line.startswith("#"):
                     extra_tags.append(next_line)
                     i += 1
                 else:
-                    # Línea de la URL del stream
                     channels.append({
                         "extinf": extinf,
                         "extra_tags": extra_tags,
@@ -130,50 +129,99 @@ def parse_m3u(content: str):
 
 def check_stream(channel: dict) -> bool:
     """
-    Verifica si el stream está vivo aceptando códigos HTTP 200, 206, 301 y 302
-    con User-Agent de navegador y timeout de 4 segundos.
+    Validación profunda real de streams HLS para eliminar canales con errores 403, 404
+    o pantalla negra:
+    1. Realiza petición GET con stream=True (timeout=5s) con User-Agent de navegador/IPTV.
+    2. Comprueba que el código HTTP sea 200 o 206 (descarta de inmediato 403, 404, 500, etc.).
+    3. Lee los primeros 2 KB y comprueba que comience con #EXTM3U (descarta HTML, vacíos o errores).
+    4. Si apunta a una variante o segmento interno (.m3u8 o .ts relativo o absoluto),
+       toma el primer enlace no comentado, resuelve su URL completa y verifica con
+       HEAD o GET (stream=True, timeout=4s) que también devuelva 200 o 206.
     """
     url = channel["url"]
 
-    # Intentar primero HEAD
     try:
-        r = requests.head(
+        # Paso 1: Petición GET con stream=True (timeout=5s)
+        with requests.get(
             url,
             headers=HEADERS,
-            timeout=TIMEOUT,
-            allow_redirects=True,
-            verify=False
-        )
-        if r.status_code in ALLOWED_HTTP_CODES or any(res.status_code in ALLOWED_HTTP_CODES for res in r.history):
-            return True
-    except Exception:
-        pass
-
-    # Si HEAD falla o no está soportado (e.g. 405 Method Not Allowed), intentar GET stream=True
-    try:
-        r = requests.get(
-            url,
-            headers=HEADERS,
-            timeout=TIMEOUT,
+            timeout=5,
             stream=True,
             allow_redirects=True,
             verify=False
-        )
-        code = r.status_code
-        has_allowed_history = any(res.status_code in ALLOWED_HTTP_CODES for res in r.history)
-        r.close()
-        if code in ALLOWED_HTTP_CODES or has_allowed_history:
-            return True
-    except Exception:
-        pass
+        ) as resp:
+            # Validar código HTTP (200 o 206)
+            if resp.status_code not in ALLOWED_HTTP_CODES:
+                return False
 
-    return False
+            # Paso 2: Leer primeros 2 KB del contenido
+            chunk = b""
+            for part in resp.iter_content(chunk_size=2048):
+                chunk += part
+                if len(chunk) >= 2048:
+                    break
+
+            text = chunk.decode("utf-8", errors="ignore").lstrip("\ufeff \r\n\t")
+
+            # Comprobar que empiece con #EXTM3U
+            if not text.startswith("#EXTM3U"):
+                return False
+
+            # Paso 3: Buscar primer enlace interno no comentado
+            internal_target = None
+            for line in text.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    internal_target = line
+                    break
+
+            # Si no hay enlace interno en los primeros 2 KB, el manifest base es válido
+            if not internal_target:
+                return True
+
+            # Resolver URL completa (relativa o absoluta)
+            resolved_url = urllib.parse.urljoin(resp.url, internal_target)
+
+        # Paso 4: Validar enlace interno (variante o segmento) con HEAD o GET (timeout=4s)
+        try:
+            head_resp = requests.head(
+                resolved_url,
+                headers=HEADERS,
+                timeout=4,
+                allow_redirects=True,
+                verify=False
+            )
+            if head_resp.status_code in ALLOWED_HTTP_CODES:
+                return True
+            if head_resp.status_code in {403, 404, 500}:
+                return False
+        except Exception:
+            pass
+
+        # Fallback a GET con stream=True (timeout=4s)
+        try:
+            with requests.get(
+                resolved_url,
+                headers=HEADERS,
+                timeout=4,
+                stream=True,
+                allow_redirects=True,
+                verify=False
+            ) as sub_resp:
+                if sub_resp.status_code in ALLOWED_HTTP_CODES:
+                    return True
+                return False
+        except Exception:
+            return False
+
+    except Exception:
+        return False
 
 
 def main():
-    print("==================================================")
-    print("Iniciando actualizacion de lista IPTV unificada")
-    print("==================================================")
+    print("==================================================", flush=True)
+    print("Actualización de lista IPTV con validación profunda HLS", flush=True)
+    print("==================================================", flush=True)
 
     all_channels = []
     seen_urls = set()
@@ -185,15 +233,15 @@ def main():
     session.headers.update(HEADERS)
 
     for source_url in SOURCES:
-        print(f"\nDescargando fuente: {source_url}...")
+        print(f"\nDescargando fuente: {source_url}...", flush=True)
         try:
             resp = session.get(source_url, timeout=15, verify=False)
             if resp.status_code != 200:
-                print(f"  [AVISO] No se pudo descargar {source_url} (HTTP {resp.status_code}). Omitiendo.")
+                print(f"  [AVISO] No se pudo descargar {source_url} (HTTP {resp.status_code}). Omitiendo.", flush=True)
                 continue
 
             parsed = parse_m3u(resp.text)
-            print(f"  Canales encontrados en la fuente: {len(parsed)}")
+            print(f"  Canales encontrados en la fuente: {len(parsed)}", flush=True)
             total_downloaded += len(parsed)
 
             for ch in parsed:
@@ -215,28 +263,28 @@ def main():
                 all_channels.append(ch)
 
         except Exception as e:
-            print(f"  [ERROR] Fallo al procesar {source_url}: {e}")
+            print(f"  [ERROR] Fallo al procesar {source_url}: {e}", flush=True)
 
-    print("\n--------------------------------------------------")
-    print(f"Resumen de extraccion:")
-    print(f" - Canales descargados: {total_downloaded}")
-    print(f" - Canales excluidos por idioma: {total_filtered_language}")
-    print(f" - URLs duplicadas omitidas: {total_duplicates}")
-    print(f" - Canales unicos a verificar: {len(all_channels)}")
-    print(f"--------------------------------------------------")
+    print("\n--------------------------------------------------", flush=True)
+    print("Resumen de extracción:", flush=True)
+    print(f" - Canales descargados: {total_downloaded}", flush=True)
+    print(f" - Canales excluidos por idioma: {total_filtered_language}", flush=True)
+    print(f" - URLs duplicadas omitidas: {total_duplicates}", flush=True)
+    print(f" - Canales únicos a verificar: {len(all_channels)}", flush=True)
+    print("--------------------------------------------------", flush=True)
 
-    print(f"\nIniciando verificacion concurrente de streams:")
-    print(f" - Hilos: {MAX_WORKERS}")
-    print(f" - Timeout: {TIMEOUT}s")
-    print(f" - Codigos HTTP validos: {ALLOWED_HTTP_CODES}")
-    print(f"Por favor espere mientras se comprueba la disponibilidad...")
+    print("\nIniciando validación profunda de streams HLS:", flush=True)
+    print(f" - Hilos: {MAX_WORKERS}", flush=True)
+    print(" - Criterio 1: GET stream=True (5s) -> HTTP 200 o 206", flush=True)
+    print(" - Criterio 2: Comprobación de cabecera #EXTM3U en primeros 2 KB", flush=True)
+    print(" - Criterio 3: Validación de segmento/variante interno (4s) -> HTTP 200 o 206", flush=True)
+    print("Por favor espere mientras se realiza la validación profunda...", flush=True)
 
     active_channels = []
     processed_count = 0
     total_to_check = len(all_channels)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Enviar todas las tareas
         futures = [executor.submit(check_stream, ch) for ch in all_channels]
 
         for ch, future in zip(all_channels, futures):
@@ -250,12 +298,12 @@ def main():
                 active_channels.append(ch)
 
             if processed_count % 100 == 0 or processed_count == total_to_check:
-                print(f"  Progreso: {processed_count}/{total_to_check} canales verificados (Activos: {len(active_channels)})")
+                print(f"  Progreso: {processed_count}/{total_to_check} canales analizados (Confirmados vivos: {len(active_channels)})", flush=True)
 
-    print(f"\nVerificacion completada: {len(active_channels)} canales activos confirmados.")
+    print(f"\nValidación profunda completada: {len(active_channels)} canales funcionales confirmados.", flush=True)
 
-    # Escribir archivo de salida mi_tele_latam.m3u en UTF-8 con cabecera unica #EXTM3U
-    print(f"Guardando {OUTPUT_FILE} en UTF-8...")
+    # Escribir archivo de salida mi_tele_latam.m3u en UTF-8 con cabecera única #EXTM3U
+    print(f"Guardando {OUTPUT_FILE} en UTF-8...", flush=True)
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         f.write("#EXTM3U\n")
         for ch in active_channels:
@@ -264,7 +312,7 @@ def main():
                 f.write(f"{extra}\n")
             f.write(f"{ch['url']}\n")
 
-    print(f"¡Listo! Se guardaron exitosamente {len(active_channels)} canales en '{OUTPUT_FILE}'.")
+    print(f"¡Listo! Se guardaron exitosamente {len(active_channels)} canales en '{OUTPUT_FILE}'.", flush=True)
     return len(active_channels)
 
 
