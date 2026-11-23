@@ -1,0 +1,42 @@
+name: Actualizar Lista IPTV
+
+on:
+  schedule:
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+
+      - name: Ejecutar actualizacion
+        run: |
+          python actualizar.py
+
+      - name: Commit y push si hay cambios
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add mi_tele_latam.m3u
+          if git diff --staged --quiet; then
+            echo "No hay cambios en la lista IPTV."
+          else
+            git commit -m "Actualizar lista IPTV [skip ci]"
+            git push
+          fi
